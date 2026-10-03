@@ -19,7 +19,7 @@ from .errors import CpError
 from .jobs import JobManager
 from .persistence import load_or_create_secret
 from .security import Signer
-from .ui import render_progress_page
+from .ui import render_progress_page, render_reclamation_page
 
 
 def _b64_decode(body: dict, field: str = "data_b64") -> bytes:
@@ -138,6 +138,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._handle(
                     lambda jid=parts[2]:
                         self.mgr.last_restore_report_dict(jid))
+            # ------------------------------------------------- space reclaim
+            if parts == ["api", "reclamation"]:
+                return self._handle(self.mgr.reclamation_overview)
+            if parts == ["api", "reclamation", "plans"]:
+                return self._handle(lambda: {
+                    "plans": self.mgr.list_reclamation_plans()})
+            if len(parts) == 4 and parts[:3] == ["api", "reclamation", "plans"]:
+                return self._handle(
+                    lambda pid=parts[3]: self.mgr.get_reclamation_plan(pid))
+            if parts == ["ui", "reclamation"]:
+                data = self.mgr.reclamation_overview()
+                return self._html(
+                    render_reclamation_page(data),
+                    self.headers.get("Accept", ""))
             if parts[:1] == ["ui"] and len(parts) == 3 and parts[1] == "jobs":
                 data = self.mgr.progress_page_data(parts[2])
                 return self._html(
@@ -173,6 +187,22 @@ class ApiHandler(BaseHTTPRequestHandler):
                     job_id=body.get("job_id"),
                     lease_ttl=float(body.get("lease_ttl", 300.0)),
                 ).snapshot(), status=201)
+
+            # ------------------------------------------ space reclamation API
+            if parts == ["api", "reclamation", "plans"]:
+                return self._handle(lambda: self.mgr.create_reclamation_plan(
+                    min_bytes=int(body.get("min_bytes", 0)),
+                    note=body.get("note"),
+                ), status=201)
+            if (len(parts) == 5
+                    and parts[:3] == ["api", "reclamation", "plans"]):
+                pid = parts[3]
+                if parts[4] == "execute":
+                    return self._handle(
+                        lambda: self.mgr.execute_reclamation_plan(pid))
+                if parts[4] == "cancel":
+                    return self._handle(
+                        lambda: self.mgr.cancel_reclamation_plan(pid))
 
             if len(parts) != 3 or parts[:2] != ["api", "jobs"]:
                 self._send_json(404, {"error": "not_found",
@@ -235,6 +265,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                     if placement else None,
                     lease_ttl=body.get("lease_ttl"),
                 ).to_dict())
+            if action == "pin_generation":
+                return self._handle(lambda: self.mgr.pin_generation(
+                    jid, int(body["generation"]), note=body.get("note")))
+            if action == "unpin_generation":
+                return self._handle(lambda: self.mgr.unpin_generation(
+                    jid, int(body["generation"])))
         except (KeyError, TypeError, ValueError) as exc:
             return self._send_json(400, {"error": "validation_error",
                                          "message": f"bad request field: {exc}"})
@@ -267,7 +303,9 @@ def render_index(mgr: JobManager) -> str:
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>HPC 抢占/检查点服务</title></head><body>
 <h1>HPC 作业抢占与检查点恢复</h1>
-<p><a href="/api/jobs">/api/jobs (JSON)</a></p>
+<p><a href="/api/jobs">/api/jobs (JSON)</a> ·
+<a href="/ui/reclamation">空间回收 (审计)</a> ·
+<a href="/api/reclamation">/api/reclamation (JSON)</a></p>
 <table border="1" cellpadding="6"><tr>
 <th>作业</th><th>名称</th><th>状态</th><th>规模</th><th>当前代际</th></tr>
 {rows or '<tr><td colspan=5>暂无作业</td></tr>'}

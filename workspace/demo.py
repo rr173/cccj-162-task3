@@ -133,7 +133,62 @@ def run_demo(data_dir: str | None = None) -> tuple[JobManager, str, str, str]:
                        for o in mgr.list_outputs("climate-7")])
     print("审计事件:", [a["event"] for a in job.audit])
 
-    return mgr, "climate-7", token, new_lease
+    banner("7) 第二轮抢占 (gen1 -> gen2): 旧代际分片/输出成为回收垃圾")
+    pre2 = mgr.preempt("climate-7", force_new_epoch=True)
+    token2 = pre2["epoch_token"]
+    placement2 = {r: ("n-c" if r == 3 else ("n-a" if r in (0, 1) else "n-b"))
+                  for r in range(4)}
+    for r in range(4):
+        for i in range(2):
+            pos = 20000 + r * 10 + i
+            mgr.upload_shard(
+                "climate-7", epoch_token=token2, rank=r, index=i,
+                node=placement2[r], input_pos=pos,
+                data=f"gen2-rank{r}.part{i}@{pos}".encode())
+    mgr.commit_checkpoint("climate-7", epoch_token=token2)
+    mgr.confirm_release("climate-7", epoch_token=token2)
+    mgr.restore("climate-7", generation=2, new_rank_nodes=placement2)
+    new_lease = job.leases.current().token
+    mgr.append_output(
+        "climate-7", lease_token=new_lease, output_id="climate-output-0002",
+        rank=0, data=b"gen2 authoritative output")
+    print("gen2 已恢复运行; gen1 的 8 个分片 + 1 个输出现已不可恢复。")
+
+    banner("8) 空间回收: 计划(水位) -> 引用变化拒绝 -> 新计划执行")
+    # 先锁定 gen1 保留 (示例: 合规要求保留该代际)
+    try:
+        mgr.pin_generation("climate-7", 1, note="合规保留 gen1")
+        print("已锁定 gen1 (该代际分片/输出不会被回收)")
+    except Exception as exc:  # noqa: BLE001 - 持久化重跑时已锁定
+        print("gen1 锁定已存在:", getattr(exc, "reason", exc))
+
+    plan = mgr.create_reclamation_plan(note="demo-reclaim")
+    print(f"计划 {plan['plan_id']}: 引用水位 seq={plan['refs_seq']}, "
+          f"候选 {len(plan['candidates'])} 项, "
+          f"预计释放 {plan['estimated_release_bytes']} 字节")
+    for c in plan["candidates"][:5]:
+        print(f"  - {c['kind']:6s} {c['blob'][:12]} "
+              f"({c['size']}B, {c['reason']})")
+
+    # 解锁后引用关系变化 -> 旧计划必须被拒绝
+    mgr.unpin_generation("climate-7", 1)
+    print("已解除 gen1 锁定; 旧计划水位作废")
+    try:
+        mgr.execute_reclamation_plan(plan["plan_id"])
+    except Exception as exc:  # noqa: BLE001
+        print(f"旧计划执行被拒绝 ({exc.http_status}/{exc.reason})")
+
+    fresh = mgr.create_reclamation_plan(note="demo-reclaim-v2")
+    result = mgr.execute_reclamation_plan(fresh["plan_id"])
+    print(f"新计划执行完成: {result['result']}, 实际删除 "
+          f"{len(result['deleted'])} 项 / {result['deleted_bytes']} 字节, "
+          f"跳过 {len(result['skipped'])} 项")
+    ov = mgr.reclamation_overview()
+    print("回收后存储水位:", ov["store"])
+    print("全局回收审计页: GET /ui/reclamation")
+    print("计划详情:       /api/reclamation/plans/" + fresh["plan_id"])
+
+    return mgr, "climate-7", token2, new_lease
 
 
 def main() -> None:

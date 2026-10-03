@@ -35,6 +35,7 @@ from .errors import (
 )
 from .leases import LeaseManager
 from .persistence import Journal
+from .reclamation import ReclamationManager
 from .storage import ContentStore, OutputLog
 
 # 作业状态
@@ -333,6 +334,9 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self.journal = Journal(data_dir)
         self.store = ContentStore(data_dir)
+        # 空间回收: 读写锁栅栏 + 引用水位 + 计划注册表 + 代际锁定。
+        # 必须在 _replay() 前创建, GC 事件重放即重建计划并补删 blob。
+        self.gc = ReclamationManager()
         self._security: list[dict] = []
         self._recording = False
         self._replay()
@@ -366,6 +370,42 @@ class JobManager:
                 del job.audit[:-AUDIT_LIMIT]
         if event == SECURITY_DENIED:
             self._security.append(evt)
+        # 引用变更事件推进回收引用水位 (实时路径; 重放由 restore_event 处理)
+        if self._recording:
+            self.gc.note_event(event, evt.get("seq") or 0)
+        return evt
+
+    def _record_global(
+        self, event: str, detail: dict, *, ts: float | None = None
+    ) -> dict:
+        """全局事件 (不归属单一作业: 空间回收计划/锁定) 落盘入口。
+
+        落盘后推进回收引用水位; GC 事件在重放时由 ReclamationManager
+        按 seq 重建。
+        """
+        detail = dict(detail)
+        detail.setdefault("ts", ts or time.time())
+        if self._recording:
+            evt = self.journal.append(event, detail)
+        else:
+            evt = {"seq": None, "ts": detail["ts"], "type": event,
+                   **{k: v for k, v in detail.items() if k != "ts"}}
+        self.gc.note_event(event, evt.get("seq") or 0)
+        # GC 事件同步进入相关作业审计流: 单作业事件带 job_id,
+        # 计划生命周期事件带 affected_jobs 列表。
+        audit_jobs = (
+            detail.get("affected_jobs")
+            if "affected_jobs" in detail
+            else ([detail["job_id"]] if detail.get("job_id") is not None
+                  else []))
+        for ajid in audit_jobs or []:
+            job = self._jobs.get(ajid)
+            if job is not None:
+                job.audit.append({"ts": evt["ts"], "event": event,
+                                  "detail": {k: v for k, v in evt.items()
+                                             if k not in ("seq", "ts", "type")}})
+                if len(job.audit) > AUDIT_LIMIT:
+                    del job.audit[:-AUDIT_LIMIT]
         return evt
 
     def security_events(self, job_id: str | None = None) -> list[dict]:
@@ -487,7 +527,7 @@ class JobManager:
         force_new_epoch=True, 旧的未完成检查点被 SUPERSEDED。
         """
         job = self.get(job_id)
-        with job.lock:
+        with self.gc.rw.read(), job.lock:
             ep = self.scheduler.current_epoch(job_id)
             if (
                 not force_new_epoch
@@ -656,7 +696,7 @@ class JobManager:
         data: bytes,
     ) -> dict:
         job = self.get(job_id)
-        with job.lock:
+        with self.gc.rw.read(), job.lock:
             self._check_epoch_token(job, epoch_token,
                                     operation="upload_shard")
             if job.state != PREEMPTING:
@@ -722,7 +762,7 @@ class JobManager:
     def confirm_release(self, job_id: str, *, epoch_token: str) -> dict:
         """确认释放资源 — 只有当前纪元检查点 COMPLETE 才允许。"""
         job = self.get(job_id)
-        with job.lock:
+        with self.gc.rw.read(), job.lock:
             self._check_epoch_token(job, epoch_token,
                                     operation="confirm_release")
             gen = job.current_generation
@@ -751,7 +791,7 @@ class JobManager:
     def abort_epoch(self, job_id: str, *, reason: str = "grace_expired") -> dict:
         """调度器在宽限期用尽后放弃: 检查点 INCOMPLETE, 作业 ABORTED。"""
         job = self.get(job_id)
-        with job.lock:
+        with self.gc.rw.read(), job.lock:
             gen = job.current_generation
             cp = job.cpm.get(gen)
             if cp.state == COMPLETE:
@@ -790,7 +830,7 @@ class JobManager:
         写入 —— 重复并发请求不可能增加结果条目。
         """
         job = self.get(job_id)
-        with job.lock:
+        with self.gc.rw.read(), job.lock:
             gen = job.output_generation
             try:
                 lease = job.leases.authorize(
@@ -821,6 +861,39 @@ class JobManager:
         job = self.get(job_id)
         return [r.to_dict() for r in job.outputs.list(generation)]
 
+    # ===================================================== space reclamation
+    def pin_generation(self, job_id: str, generation: int,
+                       note: str | None = None) -> dict:
+        """锁定保留某代际: 解锁前其分片/输出一律视为可达, GC 不会删除。"""
+        return self.gc.add_pin(self, job_id, generation, note=note)
+
+    def unpin_generation(self, job_id: str, generation: int) -> dict:
+        return self.gc.remove_pin(self, job_id, generation)
+
+    def list_pins(self, job_id: str | None = None) -> list[dict]:
+        return self.gc.list_pins(job_id)
+
+    def create_reclamation_plan(self, *, min_bytes: int = 0,
+                                note: str | None = None) -> dict:
+        """生成回收计划 (只读枚举 + 水位冻结, 不删除任何数据)。"""
+        return self.gc.create_plan(self, min_bytes=min_bytes, note=note).to_dict()
+
+    def execute_reclamation_plan(self, plan_id: str) -> dict:
+        """按计划执行删除; 引用变化 -> 409 references_changed。"""
+        return self.gc.execute_plan(self, plan_id).to_dict()
+
+    def cancel_reclamation_plan(self, plan_id: str) -> dict:
+        return self.gc.cancel_plan(self, plan_id).to_dict()
+
+    def get_reclamation_plan(self, plan_id: str) -> dict:
+        return self.gc.get_plan(plan_id).to_dict()
+
+    def list_reclamation_plans(self) -> list[dict]:
+        return [p.to_dict() for p in self.gc.list_plans()]
+
+    def reclamation_overview(self) -> dict:
+        return self.gc.overview(self)
+
     # ------------------------------------------------------------- restore
     def restore(
         self,
@@ -836,7 +909,7 @@ class JobManager:
         """
         job = self.get(job_id)
         ttl = lease_ttl or job._lease_ttl
-        with job.lock:
+        with self.gc.rw.read(), job.lock:
             # 仅当请求代际同时是 *当前已释放代际* 且已恢复过, 才幂等短路;
             # 再次抢占释放后回指旧代际必须继续走向栅栏检查
             if (
@@ -1046,6 +1119,7 @@ class JobManager:
                 "audit": list(reversed(job.audit)),
                 "security_events": list(
                     reversed(self.security_events(job_id))),
+                "reclamation": self.gc.job_view(job_id),
                 "server_ts": time.time(),
             }
 
@@ -1061,6 +1135,24 @@ class JobManager:
                   if k not in ("seq", "ts", "type")}
         ts = evt.get("ts") or time.time()
         job_id = detail.get("job_id")
+
+        # 重放路径推进引用水位 (note_event 对非引用事件为 no-op)
+        self.gc.note_event(etype, evt.get("seq") or 0)
+
+        # 空间回收事件: 重建水位/锁定/计划, 并对已确认删除的 blob 执行
+        # 幂等物理删除 (崩溃续跑: 重启后磁盘状态与引用状态重新一致)。
+        if etype.startswith("gc_"):
+            self.gc.restore_event(evt, self.store)
+            audit_jobs = (
+                detail.get("affected_jobs")
+                if etype in ("gc_plan_created", "gc_plan_completed",
+                             "gc_plan_rejected", "gc_plan_cancelled")
+                else ([job_id] if job_id is not None else []))
+            for ajid in audit_jobs or []:
+                job = self._jobs.get(ajid)
+                if job is not None:
+                    self._audit_only(job, etype, ts, detail)
+            return
 
         if etype == "job_created":
             rank_nodes = {int(r): n for r, n in

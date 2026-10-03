@@ -98,6 +98,53 @@ class ContentStore:
         with self._lock:
             return self._load(digest) is not None
 
+    def exists(self, digest: str) -> bool:
+        """仅判断 blob 是否存在 (不读入内容; 供 GC 逐项跳过判断)。"""
+        with self._lock:
+            if digest not in self._blobs:
+                return False
+            if self._disk:
+                return os.path.exists(os.path.join(self._blob_dir, digest))
+            return self._blobs[digest] is not None
+
+    def all_digests(self) -> list[str]:
+        """枚举 store 已知的全部 blob 摘要 (含磁盘惰性未载入项)。"""
+        with self._lock:
+            return list(self._blobs)
+
+    def blob_size(self, digest: str) -> int | None:
+        """返回 blob 字节数; 缺失返回 None。磁盘路径优先 stat, 避免读全量。"""
+        with self._lock:
+            if digest not in self._blobs:
+                return None
+            if self._disk:
+                path = os.path.join(self._blob_dir, digest)
+                try:
+                    return os.path.getsize(path)
+                except OSError:
+                    return None
+            data = self._blobs[digest]
+            return len(data) if data is not None else None
+
+    def delete(self, digest: str) -> bool:
+        """物理删除一个 blob, 返回是否删除成功 (缺失为 False, 幂等)。
+
+        GC 执行写锁内调用: 此时没有任何引用变更方能并发 attach 新引用。
+        内存/磁盘都先于调用方的删除事件落盘 —— 崩溃时最坏情况是物理文件
+        未删 (由重放补删), 绝不会出现"引用还在但文件没了"。
+        """
+        with self._lock:
+            if digest not in self._blobs:
+                return False
+            if self._disk:
+                path = os.path.join(self._blob_dir, digest)
+                if not os.path.exists(path):
+                    self._blobs.pop(digest, None)
+                    return False
+                os.unlink(path)
+            self._blobs.pop(digest, None)
+            return True
+
     def verify(self, digest: str) -> bool:
         """重算哈希, 损坏/缺失返回 False (调用方决定如何标记检查点)。"""
         with self._lock:

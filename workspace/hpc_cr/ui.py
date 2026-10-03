@@ -26,6 +26,11 @@ _STATE_COLORS = {
     "UP": "#0a7d2c",
     "ALIVE": "#0a7d2c",
     "LOST": "#b00020",
+    "PLANNED": "#1a4fb3",
+    "RUNNING": "#b26a00",
+    "COMPLETED": "#0a7d2c",
+    "REJECTED": "#b00020",
+    "CANCELLED": "#666",
 }
 
 
@@ -39,6 +44,130 @@ def _ts(ts: float | None) -> str:
     if not ts:
         return "-"
     return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
+def _gb(n: int) -> str:
+    """人类可读字节数。"""
+    f = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if f < 1024 or unit == "TiB":
+            return f"{f:.1f} {unit}" if unit != "B" else f"{int(f)} B"
+        f /= 1024
+    return f"{f:.1f} TiB"
+
+
+_SKIP_REASON_CN = {
+    "still_referenced": "仍被引用",
+    "blob_missing": "blob 已不存在",
+    "references_changed": "计划生成后引用发生变化",
+    "cancelled": "已取消",
+}
+
+
+def render_reclamation_job_block(recl: dict) -> str:
+    """作业页面内的空间回收区块 (代际锁定 + 涉及该作业的计划)。"""
+    pins = recl.get("pins") or []
+    pin_rows = "".join(
+        f"<tr><td>gen{_h(p['generation'])}</td>"
+        f"<td>{_ts(p.get('ts'))}</td><td>{_h(p.get('note') or '-')}</td></tr>"
+        for p in pins
+    ) or '<tr><td colspan="3">无锁定代际</td></tr>'
+
+    def plan_row(p):
+        return (
+            f"<tr><td><code>{_h(p['plan_id'])}</code><br>"
+            f"<small><a href=\"/api/reclamation/plans/{_h(p['plan_id'])}\">"
+            f"JSON</a></small></td>"
+            f"<td>{_badge(p['state'])}</td>"
+            f"<td>{_gb(p['estimated_release_bytes'])}</td>"
+            f"<td>{p.get('job_deleted_count', 0)} 项 / "
+            f"{_gb(p.get('job_deleted_bytes', 0))}</td>"
+            f"<td>{p.get('job_skipped_count', 0)}</td>"
+            f"<td>{_h(_SKIP_REASON_CN.get(p.get('reject_reason'), ''))}</td>"
+            f"<td>{_ts(p['created_ts'])}</td></tr>"
+        )
+
+    plan_rows = "".join(plan_row(p) for p in recl.get("plans") or []) \
+        or '<tr><td colspan="7">尚无涉及本作业的回收计划</td></tr>'
+    return f"""
+<h2>空间回收 (内容寻址存储)</h2>
+<p><small>完整回收审计: <a href="/ui/reclamation">全局回收页面</a> ·
+<a href="/api/reclamation">/api/reclamation</a></small></p>
+<h3>保留代际锁定 (pin)</h3>
+<table border="1" cellpadding="6"><tr><th>代际</th><th>锁定时间</th>
+<th>备注</th></tr>{pin_rows}</table>
+<h3>涉及本作业的回收计划</h3>
+<table border="1" cellpadding="6"><tr><th>计划</th><th>状态</th>
+<th>预计释放</th><th>本作业实际删除</th><th>跳过</th>
+<th>拒绝原因</th><th>生成时间</th></tr>{plan_rows}</table>"""
+
+
+def render_reclamation_page(data: dict) -> str:
+    store = data["store"]
+    pins = data.get("pins") or []
+    plans = data.get("plans") or []
+
+    pin_rows = "".join(
+        f"<tr><td>{_h(p['job_id'])}</td><td>gen{_h(p['generation'])}</td>"
+        f"<td>{_ts(p.get('ts'))}</td><td>{_h(p.get('note') or '-')}</td></tr>"
+        for p in pins
+    ) or '<tr><td colspan="4">无</td></tr>'
+
+    def plan_row(p):
+        result = p.get("result") or _h(_SKIP_REASON_CN.get(
+            p.get("reject_reason"), ""))
+        return (
+            f"<tr><td><code>{_h(p['plan_id'])}</code></td>"
+            f"<td>{_badge(p['state'])}</td>"
+            f"<td>{p['candidate_count']} 项 / "
+            f"{_gb(p['estimated_release_bytes'])}</td>"
+            f"<td>{p['deleted_count']} 项 / {_gb(p['deleted_bytes'])}</td>"
+            f"<td>{p['skipped_count']}</td>"
+            f"<td>{_h(result)}</td>"
+            f"<td>{_ts(p['created_ts'])}</td>"
+            f"<td><small><a href=\"/api/reclamation/plans/{_h(p['plan_id'])}\">"
+            f"详情 JSON</a></small></td></tr>"
+        )
+
+    plan_rows = "".join(plan_row(p) for p in plans) \
+        or '<tr><td colspan="8">尚无回收计划</td></tr>'
+    return f"""<!doctype html><html lang="zh-CN"><head>
+<meta charset="utf-8"><meta http-equiv="refresh" content="5">
+<title>空间回收 — HPC</title>
+<style>
+ body{{font-family:system-ui,sans-serif;margin:24px;color:#222}}
+ table{{border-collapse:collapse;margin:8px 0 20px}}
+ td,th{{font-size:13px;text-align:left;vertical-align:top}}
+ code{{background:#f4f4f4;padding:1px 4px;border-radius:3px}}
+</style></head><body>
+<p><a href="/">← 作业列表</a></p>
+<h1>内容寻址存储 · 空间回收审计</h1>
+<h2>存储水位 <small>(引用水位 seq {_h(data.get('refs_seq'))})</small></h2>
+<table border="1" cellpadding="8">
+<tr><th>总 blob</th><th>总占用</th><th>可达 (保留)</th>
+<th>可回收垃圾</th></tr><tr>
+<td>{store['total_blobs']}</td>
+<td>{_gb(store['total_bytes'])} ({store['total_bytes']} B)</td>
+<td>{store['live_blobs']} / {_gb(store['live_bytes'])}</td>
+<td><b>{store['garbage_blobs']}</b> / <b>{_gb(store['garbage_bytes'])}</b>
+ ({store['garbage_bytes']} B)</td>
+</tr></table>
+<h2>保留代际锁定 (pin)</h2>
+<table border="1" cellpadding="6"><tr><th>作业</th><th>代际</th>
+<th>锁定时间</th><th>备注</th></tr>{pin_rows}</table>
+<h2>回收计划</h2>
+<p><small>计划先枚举全部不可达 blob 并冻结引用水位; 执行时若引用关系发生
+变化将被拒绝 (状态 REJECTED)。崩溃后续跑/重试同一计划是安全的。
+共 {len(plans)} 个, 最近在前。</small></p>
+<table border="1" cellpadding="6"><tr><th>计划 ID</th><th>状态</th>
+<th>预计释放 (候选)</th><th>实际删除</th><th>跳过</th>
+<th>最终结果</th><th>生成时间</th><th></th></tr>{plan_rows}</table>
+<p><small>API: <code>POST /api/reclamation/plans</code> 生成 ·
+<code>POST /api/reclamation/plans/&lt;id&gt;/execute</code> 执行 ·
+<code>/cancel</code> 取消 · 作业内
+<code>action=pin_generation/unpin_generation</code> 锁定/解锁代际 ·
+页面每 5 秒自动刷新</small></p>
+</body></html>"""
 
 
 def render_progress_page(data: dict) -> str:
@@ -170,6 +299,7 @@ def render_progress_page(data: dict) -> str:
 <table border="1" cellpadding="6"><tr><th>seq</th><th>时间</th>
 <th>凭证类型</th><th>操作</th><th>原因</th><th>HTTP</th>
 <th>期望代际</th><th>目标/声明绑定</th></tr>{sec_rows}</table>
+{render_reclamation_job_block(data.get("reclamation") or {"pins": [], "plans": []})}
 <h2>审计事件 (最近 60 条)</h2>
 <table border="1" cellpadding="6"><tr><th>时间</th><th>事件</th>
 <th>详情</th></tr>{audit_rows}</table>
