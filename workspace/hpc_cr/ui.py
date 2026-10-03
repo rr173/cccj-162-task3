@@ -26,6 +26,14 @@ _STATE_COLORS = {
     "UP": "#0a7d2c",
     "ALIVE": "#0a7d2c",
     "LOST": "#b00020",
+    "PLANNED": "#1a4fb3",
+    "RUNNING": "#b26a00",
+    "COMPLETED": "#0a7d2c",
+    "PARTIALLY_COMPLETED": "#b26a00",
+    "STALE": "#b00020",
+    "DELETED": "#0a7d2c",
+    "SKIPPED": "#666",
+    "FAILED": "#b00020",
 }
 
 
@@ -39,6 +47,51 @@ def _ts(ts: float | None) -> str:
     if not ts:
         return "-"
     return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
+def render_gc_section(gc_plans: list[dict], job_id: str) -> str:
+    if not gc_plans:
+        return """
+        <h2>空间回收计划</h2>
+        <p><small>暂无回收计划 · <code>POST /api/gc/plans</code> 生成计划</small></p>
+        """
+    blocks = []
+    for p in gc_plans[:10]:
+        candidate_rows = "".join(
+            f"<tr><td><code>{_h(c['blob'][:16])}</code></td>"
+            f"<td>{_h(c['kind'])}</td><td>{c['size']}</td>"
+            f"<td>{_badge(c['status'])}</td>"
+            f"<td>{_h(c.get('skip_reason') or '')}</td>"
+            f"<td><small>{_h(c.get('eligible_reason', ''))}</small></td></tr>"
+            for c in p.get("candidates", [])[:50]
+        ) or '<tr><td colspan="6">无候选</td></tr>'
+        blocks.append(f"""
+        <h3>计划 <code>{_h(p['plan_id'])}</code> {_badge(p['state'])}</h3>
+        <p><small>
+        水位 seq {p['watermark_seq']} · 完成 seq {p.get('completion_seq') or '-'}
+        · 策略 {_h(p['policy'])} · 锁定 {_h(p.get('pins', {}))}
+        · 最小保留代际 {p.get('min_retain_generation') if p.get('min_retain_generation') is not None else '-'}
+        </small></p>
+        <table border="1" cellpadding="6">
+          <tr><th>预计释放项</th><th>预计释放字节</th><th>实际删除项</th>
+          <th>实际释放字节</th><th>跳过</th><th>结果/原因</th></tr>
+          <tr><td>{p['estimated_reclaim_items']}</td>
+          <td>{p['estimated_reclaim_bytes']}</td>
+          <td>{p['deleted_items']}</td><td>{p['deleted_bytes']}</td>
+          <td>{p['skipped_items']}</td>
+          <td>{_h(p.get('stale_reason') or p.get('error') or '成功')}
+          {_h(p.get('skip_reasons') or '')}</td></tr>
+        </table>
+        <details><summary>候选/删除明细 (前 50 项)</summary>
+        <table border="1" cellpadding="6"><tr><th>blob</th><th>类型</th>
+        <th>大小</th><th>状态</th><th>跳过原因</th><th>入选原因</th></tr>
+        {candidate_rows}</table></details>""")
+    return """
+    <h2>空间回收计划 (先计划、锁代际、按水位执行)</h2>
+    <p><small><a href="/api/gc/plans">全部计划 JSON</a> ·
+    <a href="/api/jobs/%s/gc/pins">本作业代际锁</a></small></p>
+    %s
+    """ % (_h(job_id), "".join(blocks))
 
 
 def render_progress_page(data: dict) -> str:
@@ -62,11 +115,14 @@ def render_progress_page(data: dict) -> str:
                 key = f"gen{g}:r{r}:s{i}"
                 s = shards.get(key)
                 if s:
+                    suffix = ""
+                    if s.get("collected_by"):
+                        suffix = f'<br><small>已回收 {_h(s["collected_by"][:12])}</small>'
                     cells.append(
                         '<td title="blob ' + _h(s["blob"][:16]) + ' @'
                         + _h(s["node"]) + '" style="background:#e6f4ea">✓ '
                         + _h(s["blob"][:8]) + f'<br><small>pos {s["input_pos"]}'
-                        + "</small></td>"
+                        + suffix + "</small></td>"
                     )
                 else:
                     cells.append('<td style="background:#fdecea">—</td>')
@@ -105,9 +161,10 @@ def render_progress_page(data: dict) -> str:
     out_rows = "".join(
         f"<tr><td>gen{o['generation']}</td><td>{_h(o['output_id'])}</td>"
         f"<td>{_h(o['blob'][:12])}</td><td>{o['size']}</td>"
-        f"<td>{_h(o['rank'])}</td><td>{_ts(o['ts'])}</td></tr>"
+        f"<td>{_h(o['rank'])}</td><td>{_ts(o['ts'])}</td>"
+        f"<td>{_h(o.get('collected_by', ''))}</td></tr>"
         for o in data["outputs"]
-    ) or '<tr><td colspan=6>暂无输出</td></tr>'
+    ) or '<tr><td colspan=7>暂无输出</td></tr>'
     audit_rows = "".join(
         f"<tr><td>{_ts(a['ts'])}</td><td><code>{_h(a['event'])}</code></td>"
         f"<td><small>{_h(a['detail'])}</small></td></tr>"
@@ -155,6 +212,7 @@ def render_progress_page(data: dict) -> str:
 {ep_html}
 <h2>检查点分片矩阵</h2>
 {''.join(matrices) or '<p>尚无检查点</p>'}
+{render_gc_section(data.get('gc_plans') or [], job['job_id'])}
 <h2>节点</h2>
 <table border="1" cellpadding="6"><tr><th>节点</th><th>状态</th>
 <th>最近心跳</th><th>ranks</th></tr>{node_rows}</table>
@@ -163,7 +221,7 @@ def render_progress_page(data: dict) -> str:
 <th>incarnation</th><th>input_pos</th><th>上报时间</th></tr>{proc_rows}</table>
 <h2>已提交输出 (代际隔离, 幂等去重)</h2>
 <table border="1" cellpadding="6"><tr><th>代际</th><th>output_id</th>
-<th>blob</th><th>size</th><th>rank</th><th>时间</th></tr>{out_rows}</table>
+<th>blob</th><th>size</th><th>rank</th><th>时间</th><th>回收计划</th></tr>{out_rows}</table>
 <h2>安全事件 — 授权失败 (顺序化, 不含凭证原文)</h2>
 <p><small>共 {len(security)} 条, 显示最近 100 条 ·
 <a href="/api/jobs/{_h(job['job_id'])}/security-events">JSON</a></small></p>

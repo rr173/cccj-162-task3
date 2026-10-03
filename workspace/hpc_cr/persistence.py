@@ -89,6 +89,12 @@ class Journal:
             return sorted(self._events, key=lambda e: e.get("seq", 0))
 
     @property
+    def last_seq(self) -> int:
+        """当前已持久化 (或内存模式已追加) 的最高水位。"""
+        with self._lock:
+            return self._seq
+
+    @property
     def persistent(self) -> bool:
         return self._data_dir is not None
 

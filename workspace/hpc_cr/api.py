@@ -36,6 +36,12 @@ def _b64_decode(body: dict, field: str = "data_b64") -> bytes:
         raise ValidationError(f"{field} is not valid base64") from exc
 
 
+def _optional_int(value):
+    if value is None:
+        return None
+    return int(value)
+
+
 def build_default_manager(
     secret: str | None = None, data_dir: str | None = None
 ) -> JobManager:
@@ -138,6 +144,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._handle(
                     lambda jid=parts[2]:
                         self.mgr.last_restore_report_dict(jid))
+            if parts == ["api", "gc", "plans"]:
+                return self._handle(
+                    lambda: {"plans": self.mgr.list_gc_plans()})
+            if len(parts) == 4 and parts[:3] == ["api", "gc", "plans"]:
+                return self._handle(
+                    lambda pid=parts[3]: self.mgr.get_gc_plan(pid))
+            if len(parts) == 5 and parts[:2] == ["api", "jobs"] \
+                    and parts[3:] == ["gc", "pins"]:
+                return self._handle(lambda jid=parts[2]:
+                                    self.mgr.generation_pins(jid))
             if parts[:1] == ["ui"] and len(parts) == 3 and parts[1] == "jobs":
                 data = self.mgr.progress_page_data(parts[2])
                 return self._html(
@@ -163,6 +179,23 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self.headers.get("X-Lease-Token")
 
         try:
+            if parts == ["api", "gc", "plans"]:
+                return self._handle(lambda: self.mgr.create_gc_plan(
+                    policy=body.get("policy", "recoverable"),
+                    min_retain_generation=_optional_int(
+                        body.get("min_retain_generation")),
+                    retain_generations=body.get("retain_generations"),
+                    include_pins=bool(body.get("include_pins", True)),
+                    plan_id=body.get("plan_id"),
+                ), status=201)
+            if len(parts) == 4 and parts[:3] == ["api", "gc", "plans"]:
+                pid = parts[3]
+                action = body.get("action", "execute")
+                if action == "execute":
+                    return self._handle(lambda: self.mgr.execute_gc_plan(pid))
+                self._send_json(404, {"error": "not_found",
+                                      "message": self.path})
+                return
             if parts == ["api", "jobs"]:
                 return self._handle(lambda: self.mgr.create_job(
                     name=body.get("name", "unnamed"),
@@ -226,6 +259,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                     data=_b64_decode(body),
                     rank=body.get("rank"),
                 ))
+            if action == "pin_generation":
+                return self._handle(lambda: self.mgr.pin_generation(
+                    jid, int(body["generation"]),
+                    reason=body.get("reason", "manual"),
+                    unpin=bool(body.get("unpin", False))))
             if action == "restore":
                 placement = body.get("new_rank_nodes")
                 return self._handle(lambda: self.mgr.restore(

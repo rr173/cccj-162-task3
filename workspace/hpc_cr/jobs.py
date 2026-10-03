@@ -16,6 +16,7 @@ import hashlib
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from .checkpoints import (
@@ -32,6 +33,17 @@ from .errors import (
     InvalidToken,
     NotFound,
     ValidationError,
+)
+from .gc import (
+    COMPLETED as GC_COMPLETED,
+    PARTIALLY_COMPLETED as GC_PARTIALLY_COMPLETED,
+    PLANNED as GC_PLANNED,
+    POLICY_RECOVERABLE,
+    RUNNING as GC_RUNNING,
+    STALE as GC_STALE,
+    build_snapshot,
+    new_plan_id,
+    plan_public,
 )
 from .leases import LeaseManager
 from .persistence import Journal
@@ -52,6 +64,28 @@ AUDIT_LIMIT = 500
 
 # 统一安全事件名 (审计流 + 持久化事件类型共用)
 SECURITY_DENIED = "security_authz_denied"
+
+# GC 相关事件。带 gc_plan_id 的事件不归属具体作业; pin/unpin 绑定作业。
+GC_PLAN_CREATED = "gc_plan_created"
+GC_RUN_STARTED = "gc_run_started"
+GC_BLOB_DELETED = "gc_blob_deleted"
+GC_RUN_FINISHED = "gc_run_finished"
+GC_PLAN_STALE = "gc_plan_stale"
+GC_GENERATION_PIN = "gc_generation_pin"
+GC_GENERATION_UNPIN = "gc_generation_unpin"
+
+# 会改变"仍可访问数据引用关系/保留代际"的事件。GC 计划水位只跟踪这些事件。
+_REFERENCE_EVENTS = frozenset({
+    "preempt_issued",
+    "shard_uploaded",
+    "checkpoint_complete",
+    "resources_released",
+    "epoch_abandoned",
+    "output_committed",
+    "restore_verified",
+    GC_GENERATION_PIN,
+    GC_GENERATION_UNPIN,
+})
 
 
 @dataclass
@@ -335,8 +369,47 @@ class JobManager:
         self.store = ContentStore(data_dir)
         self._security: list[dict] = []
         self._recording = False
+
+        # 全局引用临界区锁: 计划生成/执行与所有可能新增引用的写操作互斥。
+        # 固定顺序为 reference -> GC state -> 各 Job.lock (按 job_id 排序)。
+        self._reference_lock = threading.RLock()
+        self._gc_lock = threading.RLock()
+        self._pins: dict[str, set[int]] = {}
+        self._gc_plans: dict[str, dict] = {}
+        self._reference_seq = 0
         self._replay()
         self._recording = True
+
+    @contextmanager
+    def _reference_section(self):
+        """持有全局引用读/写临界区。
+
+        GC 删除计划扫描和执行用同一把锁; 分片/输出上传在完成 CAS 写入并
+        建立元数据引用期间也持有它, 因此扫描不可能看到"刚落盘但尚未引用"
+        的新 blob。
+        """
+        with self._reference_lock:
+            yield
+
+    @contextmanager
+    def _gc_world(self):
+        """全局 GC 快照/执行临界区: reference -> GC state -> 全部作业锁。
+
+        引用锁在持锁期间也冻结作业注册表 (create_job 同样先取引用锁), 因此
+        这里直接读 _jobs, 不再获取注册表锁, 避免与 restore 等
+        "Job.lock -> 注册表锁" 的既有顺序相反。
+        """
+        with self._reference_lock, self._gc_lock:
+            jobs = [self._jobs[jid] for jid in sorted(self._jobs)]
+            acquired = []
+            try:
+                for job in jobs:
+                    job.lock.acquire()
+                    acquired.append(job)
+                yield
+            finally:
+                for job in reversed(acquired):
+                    job.lock.release()
 
     # ===================================================== event plumbing
     def _record(
@@ -366,6 +439,22 @@ class JobManager:
                 del job.audit[:-AUDIT_LIMIT]
         if event == SECURITY_DENIED:
             self._security.append(evt)
+        if event in _REFERENCE_EVENTS and isinstance(evt.get("seq"), int):
+            self._reference_seq = evt["seq"]
+        return evt
+
+    def _record_global(self, event: str, detail: dict, *,
+                       ts: float | None = None) -> dict:
+        """追加不归属单个作业的全局事件 (目前为 GC 生命周期事件)。"""
+        detail = dict(detail)
+        detail.setdefault("ts", ts or time.time())
+        if self._recording:
+            evt = self.journal.append(event, detail)
+        else:
+            evt = {"seq": None, "ts": detail["ts"], "type": event,
+                   **{k: v for k, v in detail.items() if k != "ts"}}
+        if event in _REFERENCE_EVENTS and isinstance(evt.get("seq"), int):
+            self._reference_seq = evt["seq"]
         return evt
 
     def security_events(self, job_id: str | None = None) -> list[dict]:
@@ -395,7 +484,7 @@ class JobManager:
         if set(rank_nodes) != set(range(world_size)):
             raise ValidationError("rank_nodes must map every rank 0..N-1")
         job_id = job_id or f"job-{uuid.uuid4().hex[:10]}"
-        with self._lock:
+        with self._reference_lock, self._lock:
             if job_id in self._jobs:
                 raise Conflict(f"job {job_id} already exists")
             job = Job(
@@ -487,7 +576,7 @@ class JobManager:
         force_new_epoch=True, 旧的未完成检查点被 SUPERSEDED。
         """
         job = self.get(job_id)
-        with job.lock:
+        with self._reference_section(), job.lock:
             ep = self.scheduler.current_epoch(job_id)
             if (
                 not force_new_epoch
@@ -656,7 +745,7 @@ class JobManager:
         data: bytes,
     ) -> dict:
         job = self.get(job_id)
-        with job.lock:
+        with self._reference_section(), job.lock:
             self._check_epoch_token(job, epoch_token,
                                     operation="upload_shard")
             if job.state != PREEMPTING:
@@ -699,7 +788,7 @@ class JobManager:
     def commit_checkpoint(self, job_id: str, *, epoch_token: str) -> dict:
         """提交检查点: 全部分片重校验通过才可 COMPLETE。"""
         job = self.get(job_id)
-        with job.lock:
+        with self._reference_section(), job.lock:
             self._check_epoch_token(job, epoch_token,
                                     operation="commit_checkpoint")
             gen = job.current_generation
@@ -722,7 +811,7 @@ class JobManager:
     def confirm_release(self, job_id: str, *, epoch_token: str) -> dict:
         """确认释放资源 — 只有当前纪元检查点 COMPLETE 才允许。"""
         job = self.get(job_id)
-        with job.lock:
+        with self._reference_section(), job.lock:
             self._check_epoch_token(job, epoch_token,
                                     operation="confirm_release")
             gen = job.current_generation
@@ -751,7 +840,7 @@ class JobManager:
     def abort_epoch(self, job_id: str, *, reason: str = "grace_expired") -> dict:
         """调度器在宽限期用尽后放弃: 检查点 INCOMPLETE, 作业 ABORTED。"""
         job = self.get(job_id)
-        with job.lock:
+        with self._reference_section(), job.lock:
             gen = job.current_generation
             cp = job.cpm.get(gen)
             if cp.state == COMPLETE:
@@ -790,7 +879,7 @@ class JobManager:
         写入 —— 重复并发请求不可能增加结果条目。
         """
         job = self.get(job_id)
-        with job.lock:
+        with self._reference_section(), job.lock:
             gen = job.output_generation
             try:
                 lease = job.leases.authorize(
@@ -818,8 +907,331 @@ class JobManager:
                     "generation": gen, "lease_id": lease.lease_id}
 
     def list_outputs(self, job_id: str, generation: int | None = None):
+        collected = self._collected_blob_plans()
         job = self.get(job_id)
-        return [r.to_dict() for r in job.outputs.list(generation)]
+        with job.lock:
+            outputs = [r.to_dict() for r in job.outputs.list(generation)]
+        for out in outputs:
+            plan_id = collected.get(out["blob"])
+            if plan_id:
+                out["collected_by"] = plan_id
+                out["physically_available"] = False
+        return outputs
+
+    # =============================================================== GC
+    @staticmethod
+    def _normalize_generation_map(
+        value: dict | None, *, field_name: str
+    ) -> dict[str, list[int]]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValidationError(f"{field_name} must be an object")
+        result: dict[str, list[int]] = {}
+        for job_id, gens in value.items():
+            if not isinstance(job_id, str) or not isinstance(gens, list):
+                raise ValidationError(
+                    f"{field_name} must map job id to generation list")
+            try:
+                normalized = sorted({int(g) for g in gens})
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(
+                    f"{field_name} generations must be integers") from exc
+            if any(g < 0 for g in normalized):
+                raise ValidationError(
+                    f"{field_name} generations must be non-negative")
+            result[job_id] = normalized
+        return result
+
+    def pin_generation(
+        self, job_id: str, generation: int, *, reason: str = "manual",
+        unpin: bool = False,
+    ) -> dict:
+        """锁定/解锁需要保留的代际。任何变更都会使既有计划水位过期。"""
+        if generation < 0:
+            raise ValidationError("generation must be non-negative")
+        job = self.get(job_id)
+        with self._reference_lock, self._gc_lock, job.lock:
+            pins = self._pins.setdefault(job_id, set())
+            existed = generation in pins
+            if unpin:
+                pins.discard(generation)
+                if not pins:
+                    self._pins.pop(job_id, None)
+            else:
+                pins.add(generation)
+            event = GC_GENERATION_UNPIN if unpin else GC_GENERATION_PIN
+            self._record(job_id, event, {
+                "generation": generation, "reason": reason,
+                "pinned_generations": sorted(self._pins.get(job_id, [])),
+                "changed": existed if unpin else not existed,
+            })
+            return {"job_id": job_id, "generation": generation,
+                    "pinned": not unpin,
+                    "pinned_generations": sorted(self._pins.get(job_id, []))}
+
+    def generation_pins(self, job_id: str | None = None) -> dict:
+        self.get(job_id) if job_id is not None else None
+        with self._gc_lock:
+            pins = {k: sorted(v) for k, v in sorted(self._pins.items())}
+        if job_id is not None:
+            return {"job_id": job_id,
+                    "pinned_generations": pins.get(job_id, [])}
+        return {"pins": pins}
+
+    def create_gc_plan(
+        self,
+        *,
+        policy: str = POLICY_RECOVERABLE,
+        min_retain_generation: int | None = None,
+        retain_generations: dict[str, list[int]] | None = None,
+        include_pins: bool = True,
+        plan_id: str | None = None,
+        now: float | None = None,
+    ) -> dict:
+        """生成带 journal 水位和引用指纹的回收计划; 不删除任何数据。"""
+        if policy not in ("recoverable", "all_complete", "watermark"):
+            raise ValidationError("unknown gc policy")
+        if policy == "watermark" and min_retain_generation is None:
+            raise ValidationError(
+                "watermark policy requires min_retain_generation")
+        if min_retain_generation is not None and min_retain_generation < 0:
+            raise ValidationError("min_retain_generation must be non-negative")
+        retain = self._normalize_generation_map(
+            retain_generations, field_name="retain_generations")
+        for job_id in retain:
+            self.get(job_id)
+
+        with self._gc_world():
+            active = [p for p in self._gc_plans.values()
+                      if p["state"] in (GC_PLANNED, GC_RUNNING,
+                                        GC_PARTIALLY_COMPLETED)]
+            if active:
+                raise Conflict(
+                    f"gc plan {active[0]['plan_id']} is still "
+                    f"{active[0]['state']}; finish or retry it first")
+            jobs = self.list_jobs()
+            pins = {k: list(v) for k, v in self._pins.items()} \
+                if include_pins else {}
+            snapshot = build_snapshot(
+                jobs, inventory=self.store.inventory(), pins=pins,
+                policy=policy,
+                min_retain_generation=min_retain_generation,
+                retain_generations=retain)
+            ts = now or time.time()
+            plan = {
+                "plan_id": plan_id or new_plan_id(),
+                "state": GC_PLANNED,
+                "created_ts": ts,
+                "started_ts": None,
+                "finished_ts": None,
+                "watermark_seq": self._reference_seq,
+                "completion_seq": None,
+                **snapshot,
+                "deleted_items": 0,
+                "deleted_bytes": 0,
+                "skipped_items": 0,
+                "skip_reasons": {},
+                "recovery_reasons": {},
+                "error": None,
+                "stale_reason": None,
+            }
+            self._gc_plans[plan["plan_id"]] = plan
+            public = plan_public(plan)
+            self._record_global(GC_PLAN_CREATED, {"plan": public}, ts=ts)
+            return public
+
+    def get_gc_plan(self, plan_id: str) -> dict:
+        with self._gc_lock:
+            plan = self._gc_plans.get(plan_id)
+            if plan is None:
+                raise NotFound(f"unknown gc plan {plan_id}")
+            return plan_public(plan)
+
+    def list_gc_plans(self, job_id: str | None = None) -> list[dict]:
+        with self._gc_lock:
+            plans = [plan_public(self._gc_plans[pid])
+                     for pid in sorted(self._gc_plans)]
+        if job_id is None:
+            return plans
+        return [p for p in plans
+                if job_id in p.get("retained_generations", {})
+                or any(c["references"] and any(
+                    r.get("job_id") == job_id for r in c["references"])
+                    for c in p["candidates"])]
+
+    def _candidate_index(self, plan: dict) -> dict[str, dict]:
+        return {c["blob"]: c for c in plan["candidates"]}
+
+    def _plan_is_stale(self, plan: dict) -> str | None:
+        """在全局引用锁和全部作业锁内调用; 返回稳定的过期原因。"""
+        if self._reference_seq < int(plan["watermark_seq"]):
+            return "journal_rewound"
+        if self._reference_seq != int(plan["watermark_seq"]):
+            return "reference_seq_advanced"
+        jobs = self.list_jobs()
+        current = build_snapshot(
+            jobs,
+            inventory=self.store.inventory(),
+            pins=plan.get("pins", {}),
+            policy=plan["policy"],
+            min_retain_generation=plan.get("min_retain_generation"),
+            retain_generations=plan.get("retain_generations"),
+        )
+        if current["reference_fingerprint"] != plan["reference_fingerprint"]:
+            return "reference_fingerprint_changed"
+        current_retained = {
+            ref["blob"]
+            for ref in current.get("references", [])
+            if str(ref["generation"]) in current.get(
+                "retained_generations", {}).get(ref["job_id"], {})
+        }
+        planned = {c["blob"]: c for c in plan["candidates"]}
+        physical = {digest for digest, _ in self.store.inventory()}
+        extra = physical - current_retained - set(planned)
+        if extra:
+            return "physical_blob_set_changed"
+        if extra:
+            return "physical_blob_set_changed"
+        # 崩溃可能发生在"物理已 unlink、删除事件未 fsync"之间; 续跑时允许
+        # 计划内的部分 blob 已不存在, 但不允许已删除 blob 重新出现。
+        deleted = {digest for digest, c in planned.items()
+                   if c["status"] == "DELETED"}
+        if deleted & physical:
+            return "deleted_blob_reappeared"
+        return None
+
+    def _mark_plan_stale(self, plan: dict, reason: str, *,
+                         ts: float | None = None) -> dict:
+        ts = ts or time.time()
+        plan["state"] = GC_STALE
+        plan["finished_ts"] = ts
+        plan["stale_reason"] = reason
+        public = plan_public(plan)
+        self._record_global(GC_PLAN_STALE, {
+            "plan_id": plan["plan_id"], "reason": reason,
+            "watermark_seq": plan["watermark_seq"],
+            "current_seq": self._reference_seq,
+            "plan": public,
+        }, ts=ts)
+        return public
+
+    def _record_skip(self, plan: dict, candidate: dict, reason: str) -> None:
+        candidate["status"] = "SKIPPED"
+        candidate["skip_reason"] = reason
+        plan["skipped_items"] += 1
+        plan["skip_reasons"][reason] = plan["skip_reasons"].get(reason, 0) + 1
+
+    def execute_gc_plan(self, plan_id: str) -> dict:
+        """按计划删除; 水位/引用/物理集合发生变化则拒绝执行。
+
+        RUNNING 计划可在进程重启后继续。每个 blob 先物理删除、再追加删除
+        事件; 若崩溃发生在两者之间, 重试会把该 blob 记为
+        already_deleted_after_crash 而不是再次暴露给任何引用路径。
+        """
+        with self._gc_world():
+            plan = self._gc_plans.get(plan_id)
+            if plan is None:
+                raise NotFound(f"unknown gc plan {plan_id}")
+            if plan["state"] == GC_STALE:
+                raise Conflict(
+                    f"gc plan {plan_id} is stale: {plan.get('stale_reason')}")
+            if plan["state"] == GC_COMPLETED:
+                return plan_public(plan)
+            if plan["state"] not in (GC_PLANNED, GC_RUNNING,
+                                     GC_PARTIALLY_COMPLETED):
+                raise Conflict(
+                    f"gc plan {plan_id} cannot execute in state "
+                    f"{plan['state']}")
+
+            stale_reason = self._plan_is_stale(plan)
+            if stale_reason is not None:
+                public = self._mark_plan_stale(plan, stale_reason)
+                raise Conflict(
+                    f"gc plan {plan_id} rejected: {stale_reason}",
+                )
+
+            is_resume = plan["state"] in (GC_RUNNING, GC_PARTIALLY_COMPLETED)
+            if not is_resume:
+                plan["state"] = GC_RUNNING
+                plan["started_ts"] = time.time()
+                self._record_global(GC_RUN_STARTED, {
+                    "plan_id": plan_id,
+                    "watermark_seq": plan["watermark_seq"]})
+
+            errors: list[dict] = []
+            for candidate in plan["candidates"]:
+                if candidate["status"] == "DELETED":
+                    continue
+                if candidate["status"] == "SKIPPED":
+                    continue
+                digest = candidate["blob"]
+                try:
+                    existed, freed = self.store.delete(digest)
+                except OSError as exc:
+                    candidate["status"] = "FAILED"
+                    candidate["skip_reason"] = "delete_failed"
+                    plan["skipped_items"] += 1
+                    plan["skip_reasons"]["delete_failed"] = \
+                        plan["skip_reasons"].get("delete_failed", 0) + 1
+                    errors.append({"blob": digest, "error": str(exc)})
+                    continue
+                if existed:
+                    candidate["status"] = "DELETED"
+                    candidate["deleted_ts"] = time.time()
+                    plan["deleted_items"] += 1
+                    plan["deleted_bytes"] += freed
+                    recovery_reason = None
+                else:
+                    # 仅可能出现在"物理删除已成功、删除事件未及落盘"的
+                    # 崩溃恢复; 该项仍计入实际删除项, 并单独记录恢复原因。
+                    candidate["status"] = "DELETED"
+                    candidate["deleted_ts"] = time.time()
+                    plan["deleted_items"] += 1
+                    plan["deleted_bytes"] += candidate["size"]
+                    recovery_reason = "already_deleted_after_crash"
+                    plan["recovery_reasons"][recovery_reason] = \
+                        plan["recovery_reasons"].get(recovery_reason, 0) + 1
+                self._record_global(GC_BLOB_DELETED, {
+                    "plan_id": plan_id, "blob": digest,
+                    "size": candidate["size"], "existed": existed,
+                    "reason": recovery_reason,
+                    "kind": candidate["kind"],
+                    "references": candidate["references"],
+                }, ts=candidate["deleted_ts"])
+
+            ts = time.time()
+            plan["finished_ts"] = ts
+            plan["completion_seq"] = self._reference_seq
+            if errors:
+                plan["state"] = GC_PARTIALLY_COMPLETED
+                plan["error"] = "one or more blob deletions failed"
+            else:
+                plan["state"] = GC_COMPLETED
+                plan["error"] = None
+            public = plan_public(plan)
+            self._record_global(GC_RUN_FINISHED, {
+                "plan_id": plan_id, "state": plan["state"],
+                "deleted_items": plan["deleted_items"],
+                "deleted_bytes": plan["deleted_bytes"],
+                "skipped_items": plan["skipped_items"],
+                "skip_reasons": plan["skip_reasons"],
+                "recovery_reasons": plan["recovery_reasons"],
+                "errors": errors,
+                "completion_seq": plan["completion_seq"],
+                "plan": public,
+            }, ts=ts)
+            return public
+
+    def _collected_blob_plans(self) -> dict[str, str]:
+        with self._gc_lock:
+            return {
+                c["blob"]: p["plan_id"]
+                for p in self._gc_plans.values()
+                if p["state"] in (GC_COMPLETED, GC_PARTIALLY_COMPLETED,
+                                  GC_RUNNING)
+                for c in p["candidates"] if c["status"] == "DELETED"
+            }
 
     # ------------------------------------------------------------- restore
     def restore(
@@ -836,7 +1248,7 @@ class JobManager:
         """
         job = self.get(job_id)
         ttl = lease_ttl or job._lease_ttl
-        with job.lock:
+        with self._reference_section(), job.lock:
             # 仅当请求代际同时是 *当前已释放代际* 且已恢复过, 才幂等短路;
             # 再次抢占释放后回指旧代际必须继续走向栅栏检查
             if (
@@ -1024,17 +1436,31 @@ class JobManager:
     def progress_page_data(self, job_id: str) -> dict:
         """节点进度页面/进度 API 的聚合数据。"""
         job = self.get(job_id)
+        # 固定加锁顺序: GC state -> Job.lock; 先在 Job 锁外读取 GC 视图。
+        gc_plans = self.list_gc_plans(job_id)
+        collected = self._collected_blob_plans()
         with job.lock:
             cps = [c.to_dict() for c in job.cpm.list_all()]
             shard_index: dict[str, dict] = {}
             for c in job.cpm.list_all():
                 for sid, sh in c.shards.items():
-                    shard_index[f"gen{c.generation}:{sid}"] = {
+                    item = {
                         **sh.ref(),
                         "generation": c.generation,
                         "uploaded_ts": sh.uploaded_ts,
                     }
-            return {
+                    if sh.blob in collected:
+                        item["collected_by"] = collected[sh.blob]
+                        item["physically_available"] = False
+                    shard_index[f"gen{c.generation}:{sid}"] = item
+            outputs = []
+            for rec in job.outputs.list():
+                item = rec.to_dict()
+                if rec.blob in collected:
+                    item["collected_by"] = collected[rec.blob]
+                    item["physically_available"] = False
+                outputs.append(item)
+            result = {
                 "job": job.snapshot(),
                 "nodes": [n.to_dict() for n in
                           sorted(job.nodes.values(), key=lambda n: n.node_id)],
@@ -1042,12 +1468,14 @@ class JobManager:
                               for r in sorted(job.processes)],
                 "checkpoints": cps,
                 "shards": shard_index,
-                "outputs": [r.to_dict() for r in job.outputs.list()],
+                "outputs": outputs,
                 "audit": list(reversed(job.audit)),
                 "security_events": list(
                     reversed(self.security_events(job_id))),
+                "gc_plans": gc_plans,
                 "server_ts": time.time(),
             }
+        return result
 
     # ============================================================ replay
     def _replay(self) -> None:
@@ -1057,10 +1485,17 @@ class JobManager:
 
     def _apply(self, evt: dict) -> None:
         etype = evt["type"]
+        if etype in _REFERENCE_EVENTS and isinstance(evt.get("seq"), int):
+            self._reference_seq = evt["seq"]
         detail = {k: v for k, v in evt.items()
                   if k not in ("seq", "ts", "type")}
         ts = evt.get("ts") or time.time()
         job_id = detail.get("job_id")
+
+        if etype in (GC_PLAN_CREATED, GC_RUN_STARTED, GC_BLOB_DELETED,
+                     GC_RUN_FINISHED, GC_PLAN_STALE):
+            self._apply_gc_event(etype, detail, ts)
+            return
 
         if etype == "job_created":
             rank_nodes = {int(r): n for r, n in
@@ -1076,6 +1511,21 @@ class JobManager:
             )
             self._jobs[job_id] = job
             self._audit_only(job, etype, ts, detail)
+            return
+
+        if etype == GC_GENERATION_PIN:
+            pin_job = self._jobs.get(job_id)
+            if pin_job is not None:
+                self._pins.setdefault(job_id, set()).add(detail["generation"])
+                self._audit_only(pin_job, etype, ts, detail)
+            return
+        if etype == GC_GENERATION_UNPIN:
+            pin_job = self._jobs.get(job_id)
+            if pin_job is not None:
+                self._pins.get(job_id, set()).discard(detail["generation"])
+                if not self._pins.get(job_id):
+                    self._pins.pop(job_id, None)
+                self._audit_only(pin_job, etype, ts, detail)
             return
 
         job = self._jobs.get(job_id)
@@ -1179,6 +1629,66 @@ class JobManager:
         # commit_duplicate / output_duplicate) 仅审计, 无状态变更
 
         self._audit_only(job, etype, ts, detail)
+
+    def _apply_gc_event(self, etype: str, detail: dict, ts: float) -> None:
+        """重放 GC 生命周期事件, 恢复可继续执行的计划状态。"""
+        if etype == GC_PLAN_CREATED:
+            plan = dict(detail["plan"])
+            plan.setdefault("started_ts", None)
+            plan.setdefault("finished_ts", None)
+            plan.setdefault("completion_seq", None)
+            plan.setdefault("deleted_items", 0)
+            plan.setdefault("deleted_bytes", 0)
+            plan.setdefault("skipped_items", 0)
+            plan.setdefault("skip_reasons", {})
+            plan.setdefault("recovery_reasons", {})
+            plan.setdefault("error", None)
+            plan.setdefault("stale_reason", None)
+            self._gc_plans[plan["plan_id"]] = plan
+            return
+
+        plan_id = detail["plan_id"]
+        plan = self._gc_plans.get(plan_id)
+        if plan is None:
+            return
+        if etype == GC_RUN_STARTED:
+            if plan["state"] == GC_PLANNED:
+                plan["state"] = GC_RUNNING
+            plan["started_ts"] = ts
+        elif etype == GC_BLOB_DELETED:
+            candidate = self._candidate_index(plan).get(detail["blob"])
+            if candidate is None:
+                return
+            if candidate["status"] != "DELETED":
+                candidate["status"] = "DELETED"
+                candidate["deleted_ts"] = ts
+                plan["deleted_items"] += 1
+                plan["deleted_bytes"] += int(detail.get("size") or 0)
+                if detail.get("reason"):
+                    reason = detail["reason"]
+                    plan["recovery_reasons"][reason] = \
+                        plan["recovery_reasons"].get(reason, 0) + 1
+        elif etype == GC_RUN_FINISHED:
+            plan["state"] = detail["state"]
+            plan["finished_ts"] = ts
+            plan["completion_seq"] = detail.get("completion_seq")
+            plan["deleted_items"] = int(
+                detail.get("deleted_items", plan["deleted_items"]))
+            plan["deleted_bytes"] = int(
+                detail.get("deleted_bytes", plan["deleted_bytes"]))
+            plan["skipped_items"] = int(
+                detail.get("skipped_items", plan["skipped_items"]))
+            plan["skip_reasons"] = detail.get(
+                "skip_reasons", plan["skip_reasons"])
+            finished_plan = detail.get("plan") or {}
+            plan["error"] = finished_plan.get("error")
+            # 事件中的候选权威状态覆盖累计状态 (含 FAILED/SKIPPED)。
+            if finished_plan.get("candidates"):
+                plan["candidates"] = finished_plan["candidates"]
+        elif etype == GC_PLAN_STALE:
+            plan["state"] = GC_STALE
+            plan["finished_ts"] = ts
+            plan["stale_reason"] = detail.get("reason")
 
     @staticmethod
     def _audit_only(job: Job, etype: str, ts: float, detail: dict) -> None:

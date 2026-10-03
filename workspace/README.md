@@ -16,7 +16,8 @@
 | 7 | 节点失联：节点与 rank 标记 `LOST`，其分片不被接受、提交被阻塞；心跳恢复后 incarnation+1，补齐方可整体提交 | `jobs.py::mark_node_lost/heartbeat` |
 | 8 | 新一轮抢占使旧的未完成检查点 `SUPERSEDED`；旧纪元令牌不能写新代际 | `checkpoints.py`、`jobs.py` |
 | 9 | **结果提交授权失败统一处理**：缺失/伪造/超期/撤销/跨作业/旧代际凭证一律返回稳定错误（固定状态码+`reason`+固定消息，不回显凭证），并写入一条**顺序化安全事件**（全局单调 seq，不含凭证原文）；授权在写入前终止，重复并发请求不增加结果条目 | `leases.py::authorize`、`jobs.py::_deny` |
-| 10 | **事件溯源持久化**：所有状态变更（含安全事件、输出条目、恢复报告）顺序追加到 `data_dir/journal.jsonl`，blob 原子落盘；服务重启按 seq 重放重建，页面与验证报告仍可查询，旧令牌仍被栅栏，同密钥重新派生 | `persistence.py`、`jobs.py::_replay` |
+| 10 | **事件溯源持久化**：所有状态变更（含安全事件、输出条目、恢复报告、GC 计划/删除）顺序追加到 `data_dir/journal.jsonl`，blob 原子落盘；服务重启按 seq 重放重建，页面与验证报告仍可查询，旧令牌仍被栅栏，同密钥重新派生 | `persistence.py`、`jobs.py::_replay` |
+| 11 | **可审计空间回收**：GC 先生成带 journal 水位、保留代际、引用指纹、预计释放量和候选明细的计划；可锁定/解锁代际；计划生成后引用关系变化则拒绝执行；上传/恢复/回收共享全局引用临界区，绝不删除仍可访问数据；RUNNING 计划崩溃重启后可继续，每个删除动作和跳过/恢复原因均可查询 | `gc.py`、`jobs.py::create_gc_plan/execute_gc_plan` |
 
 ## 状态机
 
@@ -37,7 +38,7 @@
 
 ```bash
 # 测试
-python3 -m unittest discover -s tests -v        # 44 个测试, 含并发竞争与重启持久化
+python3 -m unittest discover -s tests -v        # 54 个测试, 含 GC/并发竞争与重启持久化
 
 # 端到端演示 (打印恢复验证报告 Markdown)
 python3 demo.py
@@ -74,6 +75,11 @@ python3 -m hpc_cr --data-dir ./hpc-data
 | `action=abandon` | 宽限耗尽放弃，检查点 INCOMPLETE |
 | `action=append_output` + `X-Lease-Token` | 提交输出；旧代际/吊销租约 412；同 output_id 幂等 |
 | `action=restore` `{generation}` | 同代际恢复验证，返回恢复验证报告 + 新租约 |
+| `action=pin_generation` `{generation, unpin, reason}` | 锁定/解锁需要保留的检查点/输出代际；变更会推进引用水位，使旧 GC 计划过期 |
+| `POST /api/gc/plans` | 生成 GC 计划（`policy`、`min_retain_generation`、`retain_generations`、`include_pins`），返回预计释放量、候选 blob、保留原因、引用指纹和水位，不删除数据 |
+| `POST /api/gc/plans/{id}` `{action:"execute"}` | 按计划执行；水位推进、引用变化或物理 blob 集合变化时返回 409 并把计划标记 `STALE` |
+| `GET  /api/gc/plans` / `GET /api/gc/plans/{id}` | 全部计划 / 单计划查询：预计/实际删除项、字节、跳过和崩溃恢复原因、最终状态 |
+| `GET  /api/jobs/{id}/gc/pins` | 查询作业已锁定代际 |
 | `GET  /api/jobs/{id}/progress.json` | 进度页聚合数据（节点/进程/分片矩阵/输出/审计） |
 | `GET  /api/jobs/{id}/checkpoints` | 全部代际检查点 |
 | `GET  /api/jobs/{id}/outputs` | 输出条目（按代际隔离） |
@@ -117,14 +123,43 @@ python3 -m hpc_cr --data-dir ./hpc-data
 `success=false` 且作业保持 `RELEASED`，不会带着坏检查点运行。报告随事件日志
 持久化，服务重启后仍可查询。
 
+## 空间回收 (GC) 语义
+
+回收采用 **计划 → 锁定/复核 → 执行 → 查询** 的显式流程:
+
+- 计划生成在全局引用临界区和全部作业锁内完成, 记录:
+  `watermark_seq`（引用类事件水位）、全部逻辑引用关系的
+  `reference_fingerprint`、每代际保留原因、物理 blob 清单、候选 blob、
+  `estimated_reclaim_items/bytes`。计划创建本身只追加 `gc_plan_created`。
+- 默认可恢复策略 (`recoverable`) 保留当前抢占/PENDING 检查点、
+  已释放待恢复检查点、运行中输出代际及其输出; `all_complete`
+  保留所有 COMPLETE 检查点; `watermark + min_retain_generation`
+  保留指定水位之后的代际。`pin_generation` 可持久化锁定任意代际。
+- 执行时重新验证水位、引用指纹和物理集合: 计划生成后发生上传、
+  抢占、释放、放弃、恢复、新输出、代际 pin/unpin 或出现未纳管 blob,
+  一律返回 409，计划转为 `STALE`，不会删除任何数据。
+- 每个 blob 删除成功后独立追加 `gc_blob_deleted`；计划完成追加
+  `gc_run_finished`，包含实际删除项/字节、`skip_reasons` 和最终状态。
+  若崩溃发生在物理 unlink 与删除事件之间，重启后继续同一计划时该项计入
+  实际删除，并记录恢复原因 `already_deleted_after_crash`。
+- 上传分片、提交输出、恢复和 GC 扫描/执行共享全局引用锁，因此不会看到
+  "blob 已落盘但元数据引用尚未建立" 的中间态；正在执行的计划会阻止生成
+  新计划，COMPLETED 计划重复执行幂等。
+
 ## 并发正确性
 
-- 每作业一把 `RLock`，加锁顺序固定 Job → 子管理器；CAS 存储独立细锁。
+- 每作业一把 `RLock`；另有全局引用锁和 GC 状态锁，固定顺序为
+  reference → GC state → 各 Job.lock（按 job_id 排序）；CAS 存储独立细锁。
 - 测试 `tests/test_concurrency_api.py` 覆盖：
   - 旧进程迟到写入与恢复后新进程并发提交相同 `output_id` → 旧写入 412、恰好一次落盘；
   - 8 线程并发重复 output / shard → 只有一次 delivered/stored；
   - 未补齐期间并发提交 6 次全部失败，补齐后才 COMPLETE；
   - 失联恢复与提交循环并发 → COMPLETE 最多出现一次且在补齐之后。
+- 测试 `tests/test_gc.py` 覆盖：
+  - 计划预计释放量/保留原因/候选明细，执行后实际删除项和字节；
+  - 代际 pin 与代际水位；计划后恢复/输出/pin 变化 → STALE 且拒绝执行；
+  - 上传、恢复与 GC 并发时仍可访问的数据绝不被删除；
+  - “物理删除已成功但事件未落盘”的崩溃重启续跑与查询接口/作业页面展示。
 - 测试 `tests/test_authz_security.py` 覆盖：
   - 缺失/伪造/错类型/撤销/超期/跨作业/旧代际凭证的稳定错误分类与无回显；
   - 每次拒绝一条顺序化安全事件（seq 唯一递增、无凭证原文）；
@@ -142,10 +177,11 @@ hpc_cr/
   storage.py      # 内容寻址 blob 存储 (内存/磁盘) + 输出去重日志
   checkpoints.py  # 分片、检查点状态机、全量重校验提交、重放回填
   leases.py       # 输出租约、代际栅栏、授权失败稳定归类
-  jobs.py         # Job/JobManager 聚合根、恢复验证报告、事件溯源/重放
+  gc.py           # GC 引用快照、保留代际、候选与计划视图
+  jobs.py         # Job/JobManager 聚合根、恢复验证报告、GC 编排、事件溯源/重放
   api.py          # stdlib ThreadingHTTPServer JSON API
-  ui.py           # 节点进度页面 HTML 渲染 (含安全事件表)
-tests/            # 44 个单元/并发/HTTP/重启持久化测试
+  ui.py           # 节点进度页面 HTML 渲染 (含安全事件与 GC 计划表)
+tests/            # 54 个单元/并发/HTTP/GC/重启持久化测试
 demo.py           # 端到端场景脚本 (可选 --data-dir 持久化)
 ```
 
@@ -155,7 +191,8 @@ demo.py           # 端到端场景脚本 (可选 --data-dir 持久化)
 
 - `journal.jsonl`：只追加事件日志，每行一个带全局单调 `seq` 的 JSON；
   写入 `flush + fsync`，重启按 seq 重放重建作业/检查点/租约/输出/审计/
-  安全事件。崩溃最多丢失未落盘的最后一行（该行对外也不可见）。
+  安全事件/GC 计划与删除进度。崩溃最多丢失未落盘的最后一行（该行对外
+  也不可见）；GC 删除若先于事件落盘，重放后按同一计划安全续跑。
 - `blobs/<sha256>`：分片与输出载荷，临时文件 fsync + 原子 rename。
 - `signer.key`：首次启动自动生成的 HMAC 密钥（0600）；也可用
   `HPC_CR_SECRET` 覆盖。令牌自描述不入库，重放时以同密钥重新派生，

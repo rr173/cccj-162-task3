@@ -221,6 +221,11 @@ class LeaseManager:
                 raise NotFound(f"no lease for generation {generation}")
             return lease
 
+    def all(self) -> list[Lease]:
+        """按代际返回全部租约 (GC 快照用于识别仍可访问的输出代际)。"""
+        with self._lock:
+            return [self._leases[g] for g in sorted(self._leases)]
+
     # -------------------------------------------------------- replay support
     def restore_grant(
         self, *, generation: int, lease_id: str, issued_ts: float,

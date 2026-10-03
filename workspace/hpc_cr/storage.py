@@ -125,6 +125,45 @@ class ContentStore:
         with self._lock:
             return sum(1 for d in self._blobs if self._load(d) is not None)
 
+    def inventory(self) -> list[tuple[str, int]]:
+        """返回当前物理存在的 ``(blob, size)``; 磁盘缺失的惰性键被忽略。"""
+        with self._lock:
+            found: list[tuple[str, int]] = []
+            for digest in list(self._blobs):
+                data = self._load(digest)
+                if data is not None:
+                    found.append((digest, len(data)))
+                else:
+                    # 磁盘文件可能由外部运维/测试清理; 不能让缺失键继续伪装
+                    # 成"存在"的 blob 并污染 GC 物理集合。
+                    self._blobs.pop(digest, None)
+            return found
+
+    def delete(self, digest: str) -> tuple[bool, int]:
+        """删除一个 blob, 返回 ``(此前是否存在, 实际释放字节数)``。
+
+        删除是幂等的: 重试/崩溃恢复时再次调用得到 ``(False, 0)``。调用方
+        必须已经通过引用快照确认该内容没有任何可达引用。
+        """
+        with self._lock:
+            data = self._load(digest)
+            if self._disk:
+                path = os.path.join(self._blob_dir, digest)
+                if data is None or not os.path.exists(path):
+                    self._blobs.pop(digest, None)
+                    return False, 0
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = len(data)
+                os.unlink(path)
+                self._blobs.pop(digest, None)
+                return True, size
+            if digest not in self._blobs or data is None:
+                return False, 0
+            self._blobs.pop(digest, None)
+            return True, len(data)
+
 
 @dataclass
 class OutputRecord:
